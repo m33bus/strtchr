@@ -5,26 +5,26 @@ const CONFIG = {
   fov: 30,
   near: 0.01,
   far: 100,
-  baseExposure: 1.04,
+  exposure: 1.04,
 
-  floatAmp: 0.018,
-  floatSpeed: 0.72,
-  tiltXAmp: 0.026,
-  tiltXSpeed: 0.58,
-  tiltYAmp: 0.014,
-  tiltYSpeed: 0.44,
+  idleFloatAmp: 0.018,
+  idleFloatSpeed: 0.72,
+  idleTiltXAmp: 0.026,
+  idleTiltXSpeed: 0.58,
+  idleTiltYAmp: 0.014,
+  idleTiltYSpeed: 0.44,
 
-  influenceRadius: 0.09,
-  pullScale: 0.15,
-  normalBias: 0.38,
-  spring: 38.0,
-  damping: 9.8,
-  forceGain: 13.0,
-  maxOffset: 0.11,
+  influenceRadiusFactor: 0.065,
+  pullScale: 0.18,
+  normalBias: 0.34,
+  spring: 37.0,
+  damping: 9.6,
+  forceGain: 14.0,
+  maxOffsetFactor: 0.08,
 
   bodyYawMax: 0.055,
   bodyPitchMax: 0.048,
-  bodyReturn: 5.3,
+  bodyReturn: 5.1,
 
   audioRateMin: 0.84,
   audioRateMax: 1.16,
@@ -44,7 +44,6 @@ const sceneWrap = document.getElementById('scene-wrap');
 const loadingEl = document.getElementById('loading');
 
 const scene = new THREE.Scene();
-
 const camera = new THREE.PerspectiveCamera(
   CONFIG.fov,
   window.innerWidth / window.innerHeight,
@@ -59,7 +58,7 @@ const renderer = new THREE.WebGLRenderer({
 });
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = CONFIG.baseExposure;
+renderer.toneMappingExposure = CONFIG.exposure;
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 sceneWrap.appendChild(renderer.domElement);
@@ -67,25 +66,22 @@ sceneWrap.appendChild(renderer.domElement);
 const clock = new THREE.Clock();
 const raycaster = new THREE.Raycaster();
 const pointerNDC = new THREE.Vector2();
+
 const root = new THREE.Group();
 scene.add(root);
 
-let headGroup = null;
-let headMesh = null;
-let geometry = null;
-let positionAttr = null;
-let vertexCount = 0;
+let headGroup = new THREE.Group();
+root.add(headGroup);
 
-let restPositions = null;
-let workingPositions = null;
-let offsets = null;
-let velocities = null;
-let spatialIndex = null;
-let boundsCenter = new THREE.Vector3();
-let boundingSize = new THREE.Vector3();
+const deformStates = [];
+const stateByMesh = new Map();
+const activePointers = new Map();
 
 let loaded = false;
-const activePointers = new Map();
+let modelBounds = new THREE.Box3();
+let modelSize = new THREE.Vector3();
+let modelCenter = new THREE.Vector3();
+
 const targetBody = new THREE.Vector2(0, 0);
 const currentBody = new THREE.Vector2(0, 0);
 
@@ -101,23 +97,16 @@ const audioFiles = [
   './assets/audio/sound4.wav'
 ];
 
-function clamp(v, a, b) {
-  return Math.max(a, Math.min(b, v));
-}
-
-function rand(min, max) {
-  return min + Math.random() * (max - min);
-}
-
-function smoothstep(edge0, edge1, x) {
-  const t = clamp((x - edge0) / (edge1 - edge0), 0, 1);
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function rand(min, max) { return min + Math.random() * (max - min); }
+function smoothstep(a, b, x) {
+  const t = clamp((x - a) / (b - a), 0, 1);
   return t * t * (3 - 2 * t);
 }
 
 function setLoading(text) {
   loadingEl.textContent = text;
 }
-
 function hideLoading() {
   loadingEl.classList.add('hidden');
   setTimeout(() => {
@@ -125,6 +114,7 @@ function hideLoading() {
   }, 250);
 }
 
+// ---------- audio ----------
 function unlockAudio() {
   if (!audioContext) {
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -134,35 +124,29 @@ function unlockAudio() {
   if (audioContext.state === 'suspended') {
     audioContext.resume().catch(() => {});
   }
-
   if (!audioTriedLoading) {
     audioTriedLoading = true;
     loadAudioSoft();
   }
 }
-
 async function loadAudioSoft() {
   if (!audioContext) return;
-  const loadedBuffers = [];
-
+  const out = [];
   for (const url of audioFiles) {
     try {
       const res = await fetch(url);
       if (!res.ok) continue;
       const arr = await res.arrayBuffer();
       const buffer = await audioContext.decodeAudioData(arr.slice(0));
-      loadedBuffers.push(buffer);
+      out.push(buffer);
     } catch (_) {}
   }
-
-  decodedBuffers = loadedBuffers;
+  decodedBuffers = out;
 }
-
 function playScrubSound(energy = 0.5) {
   const now = performance.now();
   if (now - lastAudioTime < CONFIG.minAudioIntervalMs) return;
   lastAudioTime = now;
-
   if (!audioContext || !decodedBuffers.length) return;
 
   const buffer = decodedBuffers[(Math.random() * decodedBuffers.length) | 0];
@@ -199,6 +183,7 @@ function playScrubSound(energy = 0.5) {
   source.stop(t3 + 0.01);
 }
 
+// ---------- lights ----------
 function setupLights() {
   scene.add(new THREE.HemisphereLight(0xeef4ff, 0x1c2440, 1.18));
 
@@ -219,19 +204,23 @@ function setupLights() {
   scene.add(front);
 }
 
+// ---------- model ----------
 async function loadModel() {
   const loader = new GLTFLoader();
-
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Model load timed out.')), 20000);
-
     loader.load(
       './assets/head.glb',
       (gltf) => {
         clearTimeout(timeout);
         resolve(gltf);
       },
-      undefined,
+      (event) => {
+        if (event.total) {
+          const pct = Math.round((event.loaded / event.total) * 100);
+          setLoading(`loading ${pct}%`);
+        }
+      },
       (err) => {
         clearTimeout(timeout);
         reject(err);
@@ -240,55 +229,30 @@ async function loadModel() {
   });
 }
 
-function getPrimaryMesh(sceneRoot) {
-  const meshes = [];
-  sceneRoot.traverse((obj) => {
-    if (obj.isMesh && obj.geometry?.attributes?.position) meshes.push(obj);
-  });
-
-  if (!meshes.length) {
-    throw new Error('No mesh found in head.glb');
-  }
-
-  meshes.sort((a, b) => {
-    const ac = a.geometry.attributes.position.count || 0;
-    const bc = b.geometry.attributes.position.count || 0;
-    return bc - ac;
-  });
-
-  return meshes[0];
-}
-
-function buildMaterialFromMesh(mesh) {
-  const geo = mesh.geometry;
-  const hasVertexColor = !!geo.getAttribute('color');
-  const source = mesh.material;
-
+function buildMaterial(source, geometry) {
+  const hasVertexColor = !!geometry.getAttribute('color');
   const material = new THREE.MeshPhysicalMaterial({
     color: source?.color ? source.color.clone() : new THREE.Color(0xf1e7de),
     map: source?.map || null,
     vertexColors: hasVertexColor,
-    roughness: source?.roughness ?? 0.7,
+    roughness: source?.roughness ?? 0.72,
     metalness: 0.0,
-    clearcoat: 0.12,
+    clearcoat: 0.1,
     clearcoatRoughness: 0.58,
-    sheen: 0.12,
+    sheen: 0.1,
     sheenRoughness: 0.92,
     envMapIntensity: 0.55,
     transparent: source?.transparent || false,
     opacity: source?.opacity ?? 1
   });
-
   if (source?.normalMap) material.normalMap = source.normalMap;
   if (source?.roughnessMap) material.roughnessMap = source.roughnessMap;
   if (source?.aoMap) material.aoMap = source.aoMap;
-
   return material;
 }
 
 function buildSpatialIndex(positionArray, cellSize) {
   const cells = new Map();
-
   for (let i = 0; i < positionArray.length; i += 3) {
     const x = Math.floor(positionArray[i] / cellSize);
     const y = Math.floor(positionArray[i + 1] / cellSize);
@@ -297,93 +261,120 @@ function buildSpatialIndex(positionArray, cellSize) {
     if (!cells.has(key)) cells.set(key, []);
     cells.get(key).push(i / 3);
   }
-
   return { cells, cellSize };
 }
 
-function nearbyIndices(localPoint, radius) {
-  if (!spatialIndex) return [];
-
-  const { cells, cellSize } = spatialIndex;
+function nearbyIndices(state, localPoint, radius) {
+  const { cells, cellSize } = state.spatialIndex;
   const cx = Math.floor(localPoint.x / cellSize);
   const cy = Math.floor(localPoint.y / cellSize);
   const cz = Math.floor(localPoint.z / cellSize);
   const results = [];
   const r2 = radius * radius;
+  const rp = state.restPositions;
 
   for (let dx = -1; dx <= 1; dx++) {
     for (let dy = -1; dy <= 1; dy++) {
       for (let dz = -1; dz <= 1; dz++) {
         const list = cells.get(`${cx + dx}|${cy + dy}|${cz + dz}`);
         if (!list) continue;
-
         for (const idx of list) {
           const i3 = idx * 3;
-          const px = restPositions[i3];
-          const py = restPositions[i3 + 1];
-          const pz = restPositions[i3 + 2];
-          const ddx = px - localPoint.x;
-          const ddy = py - localPoint.y;
-          const ddz = pz - localPoint.z;
-          if ((ddx * ddx + ddy * ddy + ddz * ddz) <= r2) {
-            results.push(idx);
-          }
+          const ddx = rp[i3] - localPoint.x;
+          const ddy = rp[i3 + 1] - localPoint.y;
+          const ddz = rp[i3 + 2] - localPoint.z;
+          if ((ddx * ddx + ddy * ddy + ddz * ddz) <= r2) results.push(idx);
         }
       }
     }
   }
-
   return results;
 }
 
+function addDeformMesh(sourceMesh) {
+  let geo = sourceMesh.geometry.clone();
+  if (geo.index) geo = geo.toNonIndexed();
+  geo.computeVertexNormals();
+  geo.computeBoundingBox();
+  geo.computeBoundingSphere();
+
+  const center = new THREE.Vector3();
+  const size = new THREE.Vector3();
+  geo.boundingBox.getCenter(center);
+  geo.boundingBox.getSize(size);
+
+  const positionAttr = geo.getAttribute('position');
+  const count = positionAttr.count;
+  const restPositions = new Float32Array(positionAttr.array);
+  const workingPositions = new Float32Array(positionAttr.array);
+  const offsets = new Float32Array(count * 3);
+  const velocities = new Float32Array(count * 3);
+
+  const mesh = new THREE.Mesh(geo, buildMaterial(sourceMesh.material, geo));
+  mesh.position.copy(sourceMesh.position);
+  mesh.rotation.copy(sourceMesh.rotation);
+  mesh.scale.copy(sourceMesh.scale);
+  mesh.frustumCulled = false;
+
+  const radius = Math.max(size.x, size.y, size.z) * CONFIG.influenceRadiusFactor;
+  const maxOffset = Math.max(size.x, size.y, size.z) * CONFIG.maxOffsetFactor;
+
+  const state = {
+    mesh,
+    geometry: geo,
+    positionAttr,
+    restPositions,
+    workingPositions,
+    offsets,
+    velocities,
+    vertexCount: count,
+    localCenter: center,
+    localSize: size,
+    influenceRadius: radius,
+    maxOffset,
+    spatialIndex: buildSpatialIndex(restPositions, radius * 1.6)
+  };
+
+  stateByMesh.set(mesh, state);
+  deformStates.push(state);
+  headGroup.add(mesh);
+}
+
 function prepareHead(gltf) {
-  const mesh = getPrimaryMesh(gltf.scene);
+  while (headGroup.children.length) headGroup.remove(headGroup.children[0]);
 
-  geometry = mesh.geometry.clone();
-  geometry.computeVertexNormals();
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere();
+  const sceneClone = gltf.scene.clone(true);
+  const found = [];
+  sceneClone.traverse((obj) => {
+    if (obj.isMesh && obj.geometry?.attributes?.position) found.push(obj);
+  });
 
-  const box = geometry.boundingBox.clone();
-  box.getCenter(boundsCenter);
-  box.getSize(boundingSize);
+  if (!found.length) {
+    throw new Error('No mesh found in head.glb');
+  }
 
-  geometry.translate(-boundsCenter.x, -boundsCenter.y, -boundsCenter.z);
+  for (const mesh of found) addDeformMesh(mesh);
 
-  positionAttr = geometry.getAttribute('position');
-  vertexCount = positionAttr.count;
+  modelBounds = new THREE.Box3().setFromObject(headGroup);
+  modelBounds.getSize(modelSize);
+  modelBounds.getCenter(modelCenter);
 
-  restPositions = new Float32Array(positionAttr.array);
-  workingPositions = new Float32Array(positionAttr.array);
-  offsets = new Float32Array(vertexCount * 3);
-  velocities = new Float32Array(vertexCount * 3);
-
-  spatialIndex = buildSpatialIndex(restPositions, CONFIG.influenceRadius * 1.6);
-
-  const material = buildMaterialFromMesh(mesh);
-
-  headMesh = new THREE.Mesh(geometry, material);
-  headMesh.frustumCulled = false;
-
-  headGroup = new THREE.Group();
-  headGroup.add(headMesh);
-  root.add(headGroup);
-
+  headGroup.position.sub(modelCenter);
   frameCameraToHead();
 }
 
 function frameCameraToHead() {
-  const maxDim = Math.max(boundingSize.x, boundingSize.y, boundingSize.z);
+  const maxDim = Math.max(modelSize.x, modelSize.y, modelSize.z);
   const fovRad = THREE.MathUtils.degToRad(camera.fov);
   const fitDist = (maxDim * 0.78) / Math.tan(fovRad * 0.5);
 
-  camera.position.set(0, 0.02, Math.max(2.4, fitDist + 1.15));
+  camera.position.set(0, 0.02, Math.max(2.4, fitDist + 1.1));
   camera.lookAt(0, 0.02, 0);
 
   const mobile = window.innerWidth < 820;
   const scale = mobile ? 1.0 : 1.08;
   headGroup.scale.setScalar(scale);
-  headGroup.position.set(0, -boundingSize.y * 0.04, 0);
+  headGroup.position.y -= modelSize.y * 0.04;
 }
 
 function ndcFromClient(x, y) {
@@ -393,35 +384,39 @@ function ndcFromClient(x, y) {
   return pointerNDC;
 }
 
-function hitHead(clientX, clientY) {
-  if (!headMesh) return null;
-  raycaster.setFromCamera(ndcFromClient(clientX, clientY), camera);
-  const hits = raycaster.intersectObject(headMesh, false);
+function hitHead(x, y) {
+  raycaster.setFromCamera(ndcFromClient(x, y), camera);
+  const meshes = deformStates.map(s => s.mesh);
+  const hits = raycaster.intersectObjects(meshes, false);
   return hits[0] || null;
 }
 
+// ---------- interaction ----------
 function onPointerDown(e) {
   unlockAudio();
+  if (!loaded) return;
 
-  if (!loaded || !headMesh) return;
+  const hit = hitHead(e.clientX, e.clientY);
+  if (!hit) return;
+
+  const state = stateByMesh.get(hit.object);
+  if (!state) return;
 
   if (renderer.domElement.setPointerCapture) {
     try { renderer.domElement.setPointerCapture(e.pointerId); } catch (_) {}
   }
 
-  const hit = hitHead(e.clientX, e.clientY);
-  if (!hit) return;
-
-  const localPoint = headMesh.worldToLocal(hit.point.clone());
+  const localPoint = state.mesh.worldToLocal(hit.point.clone());
   const worldNormal = hit.face?.normal
-    ? hit.face.normal.clone().transformDirection(headMesh.matrixWorld).normalize()
+    ? hit.face.normal.clone().transformDirection(state.mesh.matrixWorld).normalize()
     : new THREE.Vector3(0, 0, 1);
 
-  const n2 = hit.point.clone().add(worldNormal);
-  const n2Local = headMesh.worldToLocal(n2);
-  const localNormal = n2Local.sub(localPoint).normalize();
+  const p2 = hit.point.clone().add(worldNormal);
+  const p2Local = state.mesh.worldToLocal(p2);
+  const localNormal = p2Local.sub(localPoint).normalize();
 
   activePointers.set(e.pointerId, {
+    state,
     startX: e.clientX,
     startY: e.clientY,
     x: e.clientX,
@@ -429,9 +424,9 @@ function onPointerDown(e) {
     lastX: e.clientX,
     lastY: e.clientY,
     moveEnergy: 0,
-    localGrab: localPoint.clone(),
-    localNormal: localNormal.clone(),
-    affected: nearbyIndices(localPoint, CONFIG.influenceRadius)
+    localGrab: localPoint,
+    localNormal,
+    affected: nearbyIndices(state, localPoint, state.influenceRadius)
   });
 }
 
@@ -440,11 +435,9 @@ function onPointerMove(e) {
   if (!p) return;
   p.x = e.clientX;
   p.y = e.clientY;
-
   const dx = p.x - p.lastX;
   const dy = p.y - p.lastY;
   p.moveEnergy = Math.min(1, Math.hypot(dx, dy) / 18);
-
   p.lastX = p.x;
   p.lastY = p.y;
 }
@@ -470,102 +463,97 @@ function applyPointerForces(dt) {
     avgY += dyScreen;
     count++;
 
-    const dragScale = 1 / Math.min(window.innerWidth, window.innerHeight);
+    const screenScale = 1 / Math.min(window.innerWidth, window.innerHeight);
     const screenDist = Math.hypot(dxScreen, dyScreen);
-    const pullAmount = clamp(screenDist * dragScale * CONFIG.pullScale * 2.6, 0, CONFIG.maxOffset);
+    const pullAmount = clamp(screenDist * screenScale * p.state.maxOffset * CONFIG.pullScale * 10.0, 0, p.state.maxOffset);
 
-    const direction = new THREE.Vector3(dxScreen * 0.00185, -dyScreen * 0.00185, 0);
-    direction.addScaledVector(p.localNormal, pullAmount * CONFIG.normalBias * 6.2);
+    const direction = new THREE.Vector3(dxScreen * 0.00175, -dyScreen * 0.00175, 0);
+    direction.addScaledVector(p.localNormal, pullAmount * CONFIG.normalBias * 7.0);
     if (direction.lengthSq() < 1e-7) direction.copy(p.localNormal);
     direction.normalize().multiplyScalar(pullAmount);
 
+    const rp = p.state.restPositions;
+    const vel = p.state.velocities;
+    const radius = p.state.influenceRadius;
+
     for (const idx of p.affected) {
       const i3 = idx * 3;
-      const px = restPositions[i3];
-      const py = restPositions[i3 + 1];
-      const pz = restPositions[i3 + 2];
-
-      const ddx = px - p.localGrab.x;
-      const ddy = py - p.localGrab.y;
-      const ddz = pz - p.localGrab.z;
+      const ddx = rp[i3] - p.localGrab.x;
+      const ddy = rp[i3 + 1] - p.localGrab.y;
+      const ddz = rp[i3 + 2] - p.localGrab.z;
       const d = Math.hypot(ddx, ddy, ddz);
-
-      const w = 1.0 - smoothstep(0, CONFIG.influenceRadius, d);
+      const w = 1.0 - smoothstep(0, radius, d);
       const softness = w * w * (3 - 2 * w);
 
-      velocities[i3] += direction.x * softness * CONFIG.forceGain * dt;
-      velocities[i3 + 1] += direction.y * softness * CONFIG.forceGain * dt;
-      velocities[i3 + 2] += direction.z * softness * CONFIG.forceGain * dt;
+      vel[i3] += direction.x * softness * CONFIG.forceGain * dt;
+      vel[i3 + 1] += direction.y * softness * CONFIG.forceGain * dt;
+      vel[i3 + 2] += direction.z * softness * CONFIG.forceGain * dt;
     }
 
-    if (p.moveEnergy > 0.07) {
-      playScrubSound(p.moveEnergy);
-    }
+    if (p.moveEnergy > 0.07) playScrubSound(p.moveEnergy);
   }
 
   targetBody.x = clamp((avgY / count) / window.innerHeight, -1, 1) * CONFIG.bodyPitchMax;
   targetBody.y = clamp((avgX / count) / window.innerWidth, -1, 1) * CONFIG.bodyYawMax;
 }
 
+// ---------- simulation ----------
 function simulate(dt) {
-  if (!positionAttr) return;
+  for (const state of deformStates) {
+    const spring = CONFIG.spring;
+    const damping = CONFIG.damping;
+    const { vertexCount, offsets, velocities, restPositions, workingPositions, positionAttr, geometry, maxOffset } = state;
 
-  const spring = CONFIG.spring;
-  const damping = CONFIG.damping;
-  const maxOffset = CONFIG.maxOffset * 1.06;
+    for (let i = 0; i < vertexCount; i++) {
+      const i3 = i * 3;
 
-  for (let i = 0; i < vertexCount; i++) {
-    const i3 = i * 3;
+      const ox = offsets[i3];
+      const oy = offsets[i3 + 1];
+      const oz = offsets[i3 + 2];
+      const vx = velocities[i3];
+      const vy = velocities[i3 + 1];
+      const vz = velocities[i3 + 2];
 
-    const ox = offsets[i3];
-    const oy = offsets[i3 + 1];
-    const oz = offsets[i3 + 2];
+      const ax = (-spring * ox) - (damping * vx);
+      const ay = (-spring * oy) - (damping * vy);
+      const az = (-spring * oz) - (damping * vz);
 
-    const vx = velocities[i3];
-    const vy = velocities[i3 + 1];
-    const vz = velocities[i3 + 2];
+      velocities[i3] = vx + ax * dt;
+      velocities[i3 + 1] = vy + ay * dt;
+      velocities[i3 + 2] = vz + az * dt;
 
-    const ax = (-spring * ox) - (damping * vx);
-    const ay = (-spring * oy) - (damping * vy);
-    const az = (-spring * oz) - (damping * vz);
+      offsets[i3] += velocities[i3] * dt;
+      offsets[i3 + 1] += velocities[i3 + 1] * dt;
+      offsets[i3 + 2] += velocities[i3 + 2] * dt;
 
-    velocities[i3] = vx + ax * dt;
-    velocities[i3 + 1] = vy + ay * dt;
-    velocities[i3 + 2] = vz + az * dt;
+      const mag = Math.hypot(offsets[i3], offsets[i3 + 1], offsets[i3 + 2]);
+      if (mag > maxOffset) {
+        const s = maxOffset / mag;
+        offsets[i3] *= s;
+        offsets[i3 + 1] *= s;
+        offsets[i3 + 2] *= s;
+      }
 
-    offsets[i3] += velocities[i3] * dt;
-    offsets[i3 + 1] += velocities[i3 + 1] * dt;
-    offsets[i3 + 2] += velocities[i3 + 2] * dt;
-
-    const mag = Math.hypot(offsets[i3], offsets[i3 + 1], offsets[i3 + 2]);
-    if (mag > maxOffset) {
-      const s = maxOffset / mag;
-      offsets[i3] *= s;
-      offsets[i3 + 1] *= s;
-      offsets[i3 + 2] *= s;
+      workingPositions[i3] = restPositions[i3] + offsets[i3];
+      workingPositions[i3 + 1] = restPositions[i3 + 1] + offsets[i3 + 1];
+      workingPositions[i3 + 2] = restPositions[i3 + 2] + offsets[i3 + 2];
     }
 
-    workingPositions[i3] = restPositions[i3] + offsets[i3];
-    workingPositions[i3 + 1] = restPositions[i3 + 1] + offsets[i3 + 1];
-    workingPositions[i3 + 2] = restPositions[i3 + 2] + offsets[i3 + 2];
+    positionAttr.array.set(workingPositions);
+    positionAttr.needsUpdate = true;
+    geometry.computeVertexNormals();
   }
-
-  positionAttr.array.set(workingPositions);
-  positionAttr.needsUpdate = true;
-  geometry.computeVertexNormals();
 }
 
 function updateIdle(t, dt) {
-  if (!headGroup) return;
-
   currentBody.x += (targetBody.x - currentBody.x) * Math.min(1, CONFIG.bodyReturn * dt);
   currentBody.y += (targetBody.y - currentBody.y) * Math.min(1, CONFIG.bodyReturn * dt);
 
-  const floatY = Math.sin(t * CONFIG.floatSpeed) * CONFIG.floatAmp;
-  const tiltX = Math.sin(t * CONFIG.tiltXSpeed + 1.2) * CONFIG.tiltXAmp;
-  const tiltY = Math.cos(t * CONFIG.tiltYSpeed) * CONFIG.tiltYAmp;
+  const floatY = Math.sin(t * CONFIG.idleFloatSpeed) * CONFIG.idleFloatAmp;
+  const tiltX = Math.sin(t * CONFIG.idleTiltXSpeed + 1.2) * CONFIG.idleTiltXAmp;
+  const tiltY = Math.cos(t * CONFIG.idleTiltYSpeed) * CONFIG.idleTiltYAmp;
 
-  headGroup.position.y = -boundingSize.y * 0.04 + floatY;
+  headGroup.position.y = -modelCenter.y - modelSize.y * 0.04 + floatY;
   headGroup.rotation.x = tiltX + currentBody.x;
   headGroup.rotation.y = tiltY + currentBody.y;
 }
@@ -602,7 +590,7 @@ async function bootstrap() {
     hideLoading();
   } catch (err) {
     console.error(err);
-    setLoading('could not load head.glb');
+    setLoading(`could not load head.glb\n${err?.message || ''}`);
   }
 }
 
