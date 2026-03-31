@@ -3,18 +3,23 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>head</title>
+  <title>Head Stretch Site</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
+  <div id="bg"></div>
   <header id="header-slot" aria-hidden="true"></header>
-  <main id="scene-wrap" aria-label="Interactive 3D head"></main>
-
-  <div class="haze" aria-hidden="true"></div>
-  <div class="grain" aria-hidden="true"></div>
-
+  <div id="app"></div>
   <div id="loading">loading</div>
 
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.162.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.162.0/examples/jsm/"
+      }
+    }
+  </script>
   <script type="module" src="./app.js"></script>
 </body>
 </html>
